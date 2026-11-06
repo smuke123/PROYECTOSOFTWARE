@@ -339,8 +339,46 @@ Las filas consolidan los resultados ya citados en la sección 2. El éxito de ne
 | Rol en calificaciones | `POST` y `GET /api/calificaciones/matricula/1` con token `estudiante`; `GET /mias` con ese token; `GET /mias` con `DOCENTE` | **403**, **403**, **200** solo de la matrícula 1, **403** |
 | Pruebas | `mvn test` en los cinco módulos, imagen `maven:3.9.9-eclipse-temurin-21` | 27 casos, 0 fallos, 0 errores |
 
-## 6. Propuesta de mejora
+## 10. Oportunidades de mejora
 
-El cupo se decide con una lectura y una escritura que no comparten bloqueo. `MatriculaServiceImpl.registrar` obtiene `cupoMaximo` por Feign, cuenta las filas `ACTIVA` con `countByCursoIdAndEstado` y, si el conteo es menor, hace `save`. No existe una restricción que limite la cantidad de matrículas activas de un curso. Dos transacciones pueden leer el mismo conteo, ver un lugar libre y confirmar las dos. La verificación secuencial de `RED-001` (tercera matrícula rechazada con `2/2`) no cubre ese interleaving.
+Paso 10 del taller. Ninguna de las cinco piezas está en los `pom.xml` ni en el código de los servicios: no hay Spring Cloud Gateway, Resilience4j, broker, firma RS256 ni `@Lock`.
 
-La corrección propuesta, sin cambiar el dueño del dato, es serializar el alta por `cursoId` dentro de matrículas: un bloqueo pesimista sobre una fila de control del curso, o un `INSERT` condicionado al conteo actual en la misma sentencia. El `GET` a cursos sigue siendo la fuente del tope. La ventana entre ese GET y el commit permanece para un cambio concurrente del cupo en el otro servicio; cerrarla exigiría repetir la lectura del cupo bajo el mismo bloqueo o rechazar el alta si el conteo confirmado ya no cabe. No hace falta una base compartida ni mover `cupoMaximo` a matrículas, que dejaría una copia desactualizada cuando cursos reduzca la oferta.
+### 10.1 API Gateway centralizado
+
+**Problema.** `docker-compose.yml` publica cinco puertos en el host: 8081, 8082, 8083, 8084 y 8085. El cliente elige el proceso. Cada servicio de negocio repite la misma comprobación: `AuthValidationFilter` llama a `GET /auth/validate` con el Bearer y traduce el rol a una autoridad. El secreto HMAC no sale de auth-service, pero la decisión de autenticar está copiada en cuatro filtros.
+
+**Solución.** Un Spring Cloud Gateway como único puerto publicado. Las rutas internas (`/auth/**`, `/api/estudiantes/**`, `/api/cursos/**`, `/api/matriculas/**`, `/api/calificaciones/**`) se resuelven por path hacia el contenedor. La red `proyecto-s3_default` deja de exponerse, salvo el puerto del gateway.
+
+**Beneficio.** Un solo punto para TLS, límite de tasa y corte de rutas. El cliente deja de conocer los puertos de negocio. La comprobación del Bearer puede hacerse una vez en el gateway antes de reenviar la petición. Los filtros locales seguirían aplicando la autorización por rol mientras el secreto no se distribuya; el gateway no sustituye por sí solo la regla `hasAuthority` de cada `SecurityConfig`.
+
+### 10.2 Resiliencia con Resilience4j
+
+**Problema.** Las llamadas de negocio son OpenFeign y síncronas. `MatriculaServiceImpl.obtenerRemoto` captura `FeignException` y lanza `RemoteServiceException`. `GlobalExceptionHandler` responde **502**. No hay reintento, corte ni límite. Con `cursos-service` detenido, el alta del estudiante 6 en el curso 2 respondió **502** con código remoto `-1`: la conexión se rechazó y el fallo salió de inmediato hacia el cliente.
+
+**Solución.** Resilience4j sobre los clientes Feign: circuit breaker por destino, retry con tope en fallos de conexión y rate limiter en el llamador. El fallback de una consulta de existencia no puede inventar el `CursoRemotoDTO`; debe devolver el mismo **502**, o un **503** si el circuito está abierto, sin ejecutar el `save`.
+
+**Beneficio.** Un destino caído deja de ocupar un hilo de servlet por cada intento y deja de propagarse como una ráfaga de conexiones rechazadas. El cliente distingue un circuito abierto de un error de dominio (**400**). El retry solo aplica a la conexión caída, no a un **400** de cupo ni a un **404** de identificador.
+
+### 10.3 Mensajería de dominio
+
+**Problema.** `POST /api/matriculas` suma seis HTTP en serie, descritos en la sección 3.2: el POST del cliente, tres `GET /auth/validate` y los GET a estudiantes y a cursos. El hilo de matrículas permanece bloqueado durante los remotos. La latencia del **201** es la suma de esas llamadas. No existe una cola ni un publicador de eventos.
+
+**Solución.** Un broker (RabbitMQ o Kafka) y un hecho de dominio `MatriculaRegistradaEvent` emitido cuando la fila queda `ACTIVA`. Los efectos que hoy no forman parte de la respuesta —el conteo que consultan otros procesos, una proyección de cupo, la habilitación de calificaciones— pasan a consumidores. Si las tres validaciones de auth y las dos lecturas también salen del hilo de la petición, el contrato deja de ser **201** con la matrícula ya persistida y pasa a **202** aceptado. Si el **201** debe conservar la fila confirmada, las lecturas de existencia y de cupo siguen en el comando y el evento cubre solo lo posterior.
+
+**Beneficio.** El camino que responde al cliente deja de arrastrar trabajo que no necesita para decidir el alta. Los consumidores escalan aparte y toleran que matrículas esté ocupada. El costo es la consistencia diferida ya descrita en la sección 4.3: quien lea calificaciones o el conteo antes de consumir el evento ve el estado anterior.
+
+### 10.4 Firma asimétrica del JWT
+
+**Problema.** `JwtUtils.generateToken` firma con `SignatureAlgorithm.HS256` y `app.jwt.secret`, un literal del `application.yaml` de auth-service. Estudiantes, cursos, matrículas y calificaciones no tienen la clave. Cada petición protegida ejecuta `AuthClient.validate` contra `GET /auth/validate`. En el alta de matrícula, tres de las seis llamadas son esa validación. Auth-service caído en la segunda llamada responde **401** `TOKEN_VALIDATION_ERROR` y no se consultan estudiantes ni cursos.
+
+**Solución.** Firmar con RS256. Auth-service conserva la clave privada. Los demás servicios verifican con la clave pública, obtenida al arrancar o por un `JWKS`, y leen `role` y `estudianteId` en local. `parseToken` deja de ser una llamada Feign. La revocación antes de `exp` sigue exigiendo una lista o una versión de token consultada en auth-service; sin eso, el corte anticipado que hoy tampoco existe sigue sin existir.
+
+**Beneficio.** Desaparecen los `GET /auth/validate` del camino de cada petición. En el alta de matrícula eso elimina tres de las seis llamadas, la mitad de los saltos internos de ese caso de uso. Auth-service deja de estar en la disponibilidad de cada lectura de negocio. El secreto de firma no se copia a los otros procesos.
+
+### 10.5 Cupo atómico
+
+**Problema.** `MatriculaServiceImpl.registrar` lee `cupoMaximo` por Feign, ejecuta `countByCursoIdAndEstado(cursoId, ACTIVA)` y, si el conteo es menor, hace `save`. No hay `@Lock`, ni `LockModeType.PESSIMISTIC_WRITE`, ni una restricción que limite cuántas filas `ACTIVA` puede tener un `cursoId`. Dos transacciones leen el mismo conteo, ven un lugar libre y confirman las dos. La prueba secuencial de `RED-001` (tercera matrícula rechazada con **400** y el texto `2/2`) no cubre ese interleaving. El `@UniqueConstraint` de otras tablas no aplica a esta cantidad.
+
+**Solución.** Serializar el alta por `cursoId` dentro de matrículas: bloqueo pesimista sobre una fila de control del curso, bloqueo optimista con versión en esa fila, o un `INSERT` condicionado al conteo en la misma sentencia. El `GET` a cursos sigue siendo la fuente del tope. La ventana entre ese GET y el `commit` permanece si cursos reduce `cupoMaximo` a la vez; cerrarla exige releer el tope bajo el mismo bloqueo o rechazar el alta cuando el conteo confirmado ya no cabe. Mover `cupoMaximo` a matrículas crearía una copia que se desactualiza cuando cursos cambie la oferta.
+
+**Beneficio.** Dos altas simultáneas del último cupo dejan una sola fila `ACTIVA`. El **400** de cupo agotado pasa a ser decisión del motor o del bloqueo, no solo del `if` que corre antes del `save`. El dueño del tope sigue siendo cursos y el dueño del conteo sigue siendo matrículas.
