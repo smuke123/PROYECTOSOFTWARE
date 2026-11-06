@@ -339,8 +339,158 @@ Las filas consolidan los resultados ya citados en la sección 2. El éxito de ne
 | Rol en calificaciones | `POST` y `GET /api/calificaciones/matricula/1` con token `estudiante`; `GET /mias` con ese token; `GET /mias` con `DOCENTE` | **403**, **403**, **200** solo de la matrícula 1, **403** |
 | Pruebas | `mvn test` en los cinco módulos, imagen `maven:3.9.9-eclipse-temurin-21` | 27 casos, 0 fallos, 0 errores |
 
-## 6. Propuesta de mejora
+## 6. Cumplimiento de los diez criterios
 
-El cupo se decide con una lectura y una escritura que no comparten bloqueo. `MatriculaServiceImpl.registrar` obtiene `cupoMaximo` por Feign, cuenta las filas `ACTIVA` con `countByCursoIdAndEstado` y, si el conteo es menor, hace `save`. No existe una restricción que limite la cantidad de matrículas activas de un curso. Dos transacciones pueden leer el mismo conteo, ver un lugar libre y confirmar las dos. La verificación secuencial de `RED-001` (tercera matrícula rechazada con `2/2`) no cubre ese interleaving.
+Cada apartado nombra el código que sostiene el criterio. El detalle de cupos, integridad y calificaciones sigue en la sección 2. El grafo HTTP y el diagrama del JWT están en la sección 3.2 y en el README.
 
-La corrección propuesta, sin cambiar el dueño del dato, es serializar el alta por `cursoId` dentro de matrículas: un bloqueo pesimista sobre una fila de control del curso, o un `INSERT` condicionado al conteo actual en la misma sentencia. El `GET` a cursos sigue siendo la fuente del tope. La ventana entre ese GET y el commit permanece para un cambio concurrente del cupo en el otro servicio; cerrarla exigiría repetir la lectura del cupo bajo el mismo bloqueo o rechazar el alta si el conteo confirmado ya no cabe. No hace falta una base compartida ni mover `cupoMaximo` a matrículas, que dejaría una copia desactualizada cuando cursos reduzca la oferta.
+### 6.1 Identificación de microservicios y módulos
+
+Cinco procesos, sin parent Maven agregador. El padre de cada `pom.xml` es `spring-boot-starter-parent` 3.2.5 y `java.version` es 21. La imagen de ejecución es `eclipse-temurin:21-jre`. El empaquetado usa `maven:3.9.9-eclipse-temurin-21`. Compose publica la red `proyecto-s3_default`.
+
+| Servicio | Puerto | H2 | Módulos internos |
+|---|---:|---|---|
+| auth-service | 8081 | `authdb` | `controller`, `service` (`AuthServiceImpl`), `repository`, `util` (`JwtUtils`), `config` (`DataSeeder`, `SecurityConfig`) |
+| estudiantes-service | 8082 | `estudiantesdb` | `controller`, `handler` (`EstudianteHandler`), `service`, `repository`, `client`, `security` |
+| cursos-service | 8083 | `cursosdb` | `controller`, `handler` (`CursoHandler`), `service`, `repository`, `client`, `security` |
+| matriculas-service | 8084 | `matriculasdb` | `controller`, `handler` (`MatriculaHandler`), `service`, `repository`, `client`, `security` |
+| calificaciones-service | 8085 | `calificacionesdb` | `controller`, `handler` (`CalificacionHandler`), `service`, `repository`, `client`, `security` |
+
+### 6.2 Responsabilidades
+
+`AuthServiceImpl` autentica y emite el JWT. No llama a otro servicio. `EstudianteServiceImpl` mantiene el expediente: alta, consulta, actualización y borrado condicionado al conteo de matrículas activas. El correo es único. `CursoServiceImpl` mantiene el catálogo y el `cupoMaximo`. `MatriculaServiceImpl` registra y anula; comprueba que el estudiante y el curso existan y que el cupo alcance. `CalificacionServiceImpl` guarda la nota por corte, exige matrícula `ACTIVA` para escribir y calcula el promedio ponderado sin persistirlo.
+
+### 6.3 Arquitectura
+
+En los cuatro servicios de negocio el corte es `Controller` → `Handler` → `Service` → `Repository`. El controlador no recibe la entidad. El handler traduce el DTO de entrada a entidad y la entidad al DTO de salida. `EstudianteCreateDTO` no tiene `id`. Los DTO remotos (`EstudianteRemotoDTO`, `CursoRemotoDTO`, `MatriculaRemotaDTO`) viven en el llamador, no en un JAR compartido.
+
+Auth no tiene handler: `AuthController` llama a `AuthServiceImpl`, que usa `UsuarioRepository` y `JwtUtils`.
+
+La sesión de negocio es stateless. `SecurityConfig` de estudiantes, cursos, matrículas y calificaciones fija `SessionCreationPolicy.STATELESS`, desactiva CSRF y antepone `AuthValidationFilter`. Auth-service desactiva CSRF y abre `/auth/**`; no declara `STATELESS` porque no guarda sesión: el resultado del login es el JWT.
+
+Compose construye cada imagen desde el JAR ya empaquetado, publica `8081`–`8085` y ordena el arranque con `depends_on` sin `healthcheck`.
+
+### 6.4 Funcionalidades
+
+Login: `DataSeeder` inserta `admin`, `docente` y `estudiante` si `usuarios` está vacía. `AuthServiceImpl.login` compara con `BCryptPasswordEncoder.matches` y `JwtUtils.generateToken` firma HS256 con `sub`, `role`, `iat`, `exp` y, solo en el estudiante, `estudianteId`.
+
+Expediente: `EstudianteServiceImpl.crear` rechaza el correo repetido con `existsByEmail` y persiste con `save`. La semilla carga 50 filas `estudianteN@demoacademico.edu`.
+
+Catálogo: `CursoServiceImpl` aplica código único, créditos de 1 a 10 y cupo de entrada de 1 a 60. La semilla crea `IS3-001`, `BD2-001` y `RED-001`.
+
+Matrícula: `MatriculaServiceImpl.registrar` lee estudiante y curso por Feign, niega el duplicado `ACTIVA`, compara `countByCursoIdAndEstado` con `cupoMaximo` y guarda `ACTIVA`. `anular` pasa la fila a `ANULADA` sin borrarla.
+
+Calificación: `CalificacionServiceImpl.registrar` persiste corte y nota. Los pesos están en `PESOS`: 0.30, 0.30 y 0.40. `calcularPromedio` divide por la suma de los pesos presentes, escala 2, `HALF_UP`. `ResumenCalificaciones.completa()` exige los tres cortes. El autor lo toma el controlador de `authentication.getName()` y lo pasa al servicio; no viaja en `CalificacionCreateDTO`.
+
+### 6.5 Roles y permisos
+
+Las reglas están en el `SecurityConfig` de cada servicio. `/mias` se declara antes del comodín.
+
+| Operación | ADMIN | DOCENTE | ESTUDIANTE |
+|---|---|---|---|
+| Estudiantes, lectura | sí | sí | no |
+| Estudiantes, escritura y borrado | sí | no | no |
+| Cursos, lectura | sí | sí | sí |
+| Cursos, escritura y borrado | sí | no | no |
+| Matrículas, lectura general y conteo | sí | sí | no |
+| Matrículas, alta y anulación | sí | no | no |
+| `GET /api/matriculas/mias` | no | no | sí |
+| Calificaciones, lectura por matrícula y escritura | sí | sí | no |
+| `GET /api/calificaciones/mias` | no | no | sí |
+
+`MatriculaController` inyecta `@AuthenticationPrincipal UsuarioAutenticado` en `/mias` y usa `usuario.estudianteId()`. Ignora un `estudianteId` de la query. Con `?estudianteId=99` y el token `estudiante`, la respuesta siguió siendo la matrícula del estudiante 1. Un listado `GET /api/matriculas?estudianteId=1` abierto a ese rol sería un IDOR. `CalificacionServiceImpl.misCalificaciones` no recibe el id: llama a `/api/matriculas/mias` con el Bearer propagado.
+
+### 6.6 Comunicación entre microservicios
+
+Clientes Feign: `AuthClient` en los cuatro servicios de negocio; `EstudiantesClient` y `CursosClient` en matrículas; `MatriculasClient` en estudiantes, cursos y calificaciones. `FeignAuthPropagationConfig.authTokenPropagationInterceptor` copia `Authorization` desde `RequestContextHolder` si el template aún no lo trae. `AuthClient.validate` lo declara en la interfaz y el interceptor no lo duplica.
+
+`POST /api/matriculas` hace seis HTTP en serie. El diagrama de secuencia, con la emisión del JWT y la copia del Bearer, está en la sección 3.2 y en el README.
+
+1. Cliente → matrículas, `POST /api/matriculas`.
+2. Filtro de matrículas → auth, `GET /auth/validate`.
+3. `EstudiantesClient` → estudiantes, `GET /api/estudiantes/{id}`.
+4. Filtro de estudiantes → auth, `GET /auth/validate`.
+5. `CursosClient` → cursos, `GET /api/cursos/{id}`.
+6. Filtro de cursos → auth, `GET /auth/validate`.
+
+El duplicado y el cupo se resuelven después, en la base local.
+
+### 6.7 Gestión y persistencia
+
+Cada `application.yaml` usa `jdbc:h2:mem:<nombre>;DB_CLOSE_DELAY=-1` y `ddl-auto: update`. No hay clave foránea entre procesos. `estudianteId`, `cursoId` y `matriculaId` son `Long`.
+
+| Restricción | Entidad | Columnas |
+|---|---|---|
+| `uk_estudiante_email` | `Estudiante` | `email` |
+| `uk_curso_codigo` | `Curso` | `codigo` |
+| `uk_calificacion_matricula_corte` | `Calificacion` | `matricula_id`, `corte` |
+
+`EstadoMatricula` se guarda con `@Enumerated(EnumType.STRING)`. El aislamiento es el de la base local: el `INSERT` y el unique son atómicos dentro de ese proceso. Entre servicios la lectura HTTP y la escritura posterior no comparten transacción. El detalle está en la sección 4.3. No hay unique sobre la cantidad de matrículas `ACTIVA` de un curso.
+
+### 6.8 Calidad del código
+
+Cada servicio cohesiona un agregado. El acoplamiento entre procesos es el contrato JSON, no el código fuente. El costo de no compartir librería es la copia de `AuthValidationFilter`, `GlobalExceptionHandler` y `ResponseBuilder`. `ResponseBuilder.ok` y `created` arman `ApiResponse` (`success`, `message`, `data`). Los DTO de entrada validan el borde (`@NotBlank`, `@Email`, `@Min`, `@DecimalMax`) y los de salida no exponen la entidad.
+
+El tope pedido es 150 líneas por clase. En `src` hay 147 archivos `.java` y ninguno llega a 150. Las tres clases más largas son `CalificacionServiceImpl` (139), `GlobalExceptionHandler` de auth-service (133) y `MatriculaServiceImpl` (116). Los handlers quedan entre 55 y 66 líneas.
+
+### 6.9 Seguridad, errores y pruebas
+
+`PasswordEncoder` es `BCryptPasswordEncoder`. `JwtUtils.signWith` usa `SignatureAlgorithm.HS256` y `app.jwt.secret`. `AuthValidationFilter` envuelve solo `authClient.validate`. `filterChain.doFilter` queda fuera del `try`, como detalla la sección 3.1. Un 401 de auth es `TOKEN_INVALID`. Otra `FeignException` es `TOKEN_VALIDATION_ERROR`. El header ausente es `AUTH_HEADER_MISSING`.
+
+| Código | Origen |
+|---|---|
+| **400** | `BusinessException`, validación de DTO y cuerpo mal formado, en `GlobalExceptionHandler` |
+| **401** | `InvalidCredentialsException` (`AUTH_INVALID_CREDENTIALS`) e `InvalidTokenException` (`AUTH_INVALID_TOKEN`) en auth; `CustomAuthenticationEntryPoint` en el resto |
+| **403** | `CustomAccessDeniedHandler` y `AccessDeniedException` (`AUTH_FORBIDDEN`) |
+| **404** | `NotFoundException` |
+| **409** | `ConflictException` al borrar con matrículas activas; `DataIntegrityViolationException` si el unique pierde la carrera |
+| **502** | `RemoteServiceException` cuando Feign ya fue traducido en el servicio |
+
+`mvn test` en los cinco módulos, con la imagen `maven:3.9.9-eclipse-temurin-21`, dio 27 casos, 0 fallos y 0 errores. El desglose está en la sección 2.10: `JwtUtilsTest`, `AuthFlowIntegrationTest`, `EstudianteServiceImplTest`, `CursoServiceImplTest`, `MatriculaServiceImplTest`, `MatriculaControllerSecurityTest` y `CalificacionServiceImplTest`.
+
+### 6.10 Oportunidades de mejora
+
+La sección 10 desarrolla cinco propuestas que el código no implementa: API Gateway ante los cinco puertos publicados, Resilience4j ante el **502** inmediato de Feign, un broker para el grafo síncrono de seis llamadas, RS256 para dejar de invocar `/auth/validate` en cada petición, y un bloqueo o una restricción de cupo en `MatriculaServiceImpl.registrar`.
+
+## 10. Oportunidades de mejora
+
+Paso 10 del taller. Ninguna de las cinco piezas está en los `pom.xml` ni en el código de los servicios: no hay Spring Cloud Gateway, Resilience4j, broker, firma RS256 ni `@Lock`.
+
+### 10.1 API Gateway centralizado
+
+**Problema.** `docker-compose.yml` publica cinco puertos en el host: 8081, 8082, 8083, 8084 y 8085. El cliente elige el proceso. Cada servicio de negocio repite la misma comprobación: `AuthValidationFilter` llama a `GET /auth/validate` con el Bearer y traduce el rol a una autoridad. El secreto HMAC no sale de auth-service, pero la decisión de autenticar está copiada en cuatro filtros.
+
+**Solución.** Un Spring Cloud Gateway como único puerto publicado. Las rutas internas (`/auth/**`, `/api/estudiantes/**`, `/api/cursos/**`, `/api/matriculas/**`, `/api/calificaciones/**`) se resuelven por path hacia el contenedor. La red `proyecto-s3_default` deja de exponerse, salvo el puerto del gateway.
+
+**Beneficio.** Un solo punto para TLS, límite de tasa y corte de rutas. El cliente deja de conocer los puertos de negocio. La comprobación del Bearer puede hacerse una vez en el gateway antes de reenviar la petición. Los filtros locales seguirían aplicando la autorización por rol mientras el secreto no se distribuya; el gateway no sustituye por sí solo la regla `hasAuthority` de cada `SecurityConfig`.
+
+### 10.2 Resiliencia con Resilience4j
+
+**Problema.** Las llamadas de negocio son OpenFeign y síncronas. `MatriculaServiceImpl.obtenerRemoto` captura `FeignException` y lanza `RemoteServiceException`. `GlobalExceptionHandler` responde **502**. No hay reintento, corte ni límite. Con `cursos-service` detenido, el alta del estudiante 6 en el curso 2 respondió **502** con código remoto `-1`: la conexión se rechazó y el fallo salió de inmediato hacia el cliente.
+
+**Solución.** Resilience4j sobre los clientes Feign: circuit breaker por destino, retry con tope en fallos de conexión y rate limiter en el llamador. El fallback de una consulta de existencia no puede inventar el `CursoRemotoDTO`; debe devolver el mismo **502**, o un **503** si el circuito está abierto, sin ejecutar el `save`.
+
+**Beneficio.** Un destino caído deja de ocupar un hilo de servlet por cada intento y deja de propagarse como una ráfaga de conexiones rechazadas. El cliente distingue un circuito abierto de un error de dominio (**400**). El retry solo aplica a la conexión caída, no a un **400** de cupo ni a un **404** de identificador.
+
+### 10.3 Mensajería de dominio
+
+**Problema.** `POST /api/matriculas` suma seis HTTP en serie, descritos en la sección 3.2: el POST del cliente, tres `GET /auth/validate` y los GET a estudiantes y a cursos. El hilo de matrículas permanece bloqueado durante los remotos. La latencia del **201** es la suma de esas llamadas. No existe una cola ni un publicador de eventos.
+
+**Solución.** Un broker (RabbitMQ o Kafka) y un hecho de dominio `MatriculaRegistradaEvent` emitido cuando la fila queda `ACTIVA`. Los efectos que hoy no forman parte de la respuesta —el conteo que consultan otros procesos, una proyección de cupo, la habilitación de calificaciones— pasan a consumidores. Si las tres validaciones de auth y las dos lecturas también salen del hilo de la petición, el contrato deja de ser **201** con la matrícula ya persistida y pasa a **202** aceptado. Si el **201** debe conservar la fila confirmada, las lecturas de existencia y de cupo siguen en el comando y el evento cubre solo lo posterior.
+
+**Beneficio.** El camino que responde al cliente deja de arrastrar trabajo que no necesita para decidir el alta. Los consumidores escalan aparte y toleran que matrículas esté ocupada. El costo es la consistencia diferida ya descrita en la sección 4.3: quien lea calificaciones o el conteo antes de consumir el evento ve el estado anterior.
+
+### 10.4 Firma asimétrica del JWT
+
+**Problema.** `JwtUtils.generateToken` firma con `SignatureAlgorithm.HS256` y `app.jwt.secret`, un literal del `application.yaml` de auth-service. Estudiantes, cursos, matrículas y calificaciones no tienen la clave. Cada petición protegida ejecuta `AuthClient.validate` contra `GET /auth/validate`. En el alta de matrícula, tres de las seis llamadas son esa validación. Auth-service caído en la segunda llamada responde **401** `TOKEN_VALIDATION_ERROR` y no se consultan estudiantes ni cursos.
+
+**Solución.** Firmar con RS256. Auth-service conserva la clave privada. Los demás servicios verifican con la clave pública, obtenida al arrancar o por un `JWKS`, y leen `role` y `estudianteId` en local. `parseToken` deja de ser una llamada Feign. La revocación antes de `exp` sigue exigiendo una lista o una versión de token consultada en auth-service; sin eso, el corte anticipado que hoy tampoco existe sigue sin existir.
+
+**Beneficio.** Desaparecen los `GET /auth/validate` del camino de cada petición. En el alta de matrícula eso elimina tres de las seis llamadas, la mitad de los saltos internos de ese caso de uso. Auth-service deja de estar en la disponibilidad de cada lectura de negocio. El secreto de firma no se copia a los otros procesos.
+
+### 10.5 Cupo atómico
+
+**Problema.** `MatriculaServiceImpl.registrar` lee `cupoMaximo` por Feign, ejecuta `countByCursoIdAndEstado(cursoId, ACTIVA)` y, si el conteo es menor, hace `save`. No hay `@Lock`, ni `LockModeType.PESSIMISTIC_WRITE`, ni una restricción que limite cuántas filas `ACTIVA` puede tener un `cursoId`. Dos transacciones leen el mismo conteo, ven un lugar libre y confirman las dos. La prueba secuencial de `RED-001` (tercera matrícula rechazada con **400** y el texto `2/2`) no cubre ese interleaving. El `@UniqueConstraint` de otras tablas no aplica a esta cantidad.
+
+**Solución.** Serializar el alta por `cursoId` dentro de matrículas: bloqueo pesimista sobre una fila de control del curso, bloqueo optimista con versión en esa fila, o un `INSERT` condicionado al conteo en la misma sentencia. El `GET` a cursos sigue siendo la fuente del tope. La ventana entre ese GET y el `commit` permanece si cursos reduce `cupoMaximo` a la vez; cerrarla exige releer el tope bajo el mismo bloqueo o rechazar el alta cuando el conteo confirmado ya no cabe. Mover `cupoMaximo` a matrículas crearía una copia que se desactualiza cuando cursos cambie la oferta.
+
+**Beneficio.** Dos altas simultáneas del último cupo dejan una sola fila `ACTIVA`. El **400** de cupo agotado pasa a ser decisión del motor o del bloqueo, no solo del `if` que corre antes del `save`. El dueño del tope sigue siendo cursos y el dueño del conteo sigue siendo matrículas.
