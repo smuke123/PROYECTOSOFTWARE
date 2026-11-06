@@ -232,26 +232,38 @@ En matrículas el principal construido dentro de ese bloque es `UsuarioAutentica
 
 Las seis son síncronas y van en serie. No hay un séptimo salto en el camino feliz: el conteo de cupo y el duplicado se resuelven en la base local de matrículas.
 
+El token sale de `POST /auth/login`. `LoginResponse` lleva `token`, `username` y `role`. La firma es HS256 en `JwtUtils.generateToken`. Cada salto de negocio repite `GET /auth/validate` con el mismo `Authorization`. La respuesta es `TokenValidationResponse`: `valid`, `username`, `role` y `estudianteId`. Para `admin` el claim no se emitió y el campo vuelve nulo. `FeignAuthPropagationConfig` copia el header hacia estudiantes y cursos porque `EstudiantesClient` y `CursosClient` no lo declaran. Esos dos GET responden `ApiResponse` (`success`, `message`, `data`). Matrículas lo deserializa como `RemoteApiResponse`.
+
 ```mermaid
 sequenceDiagram
-    participant C as Cliente
-    participant M as matriculas-service
-    participant A as auth-service
-    participant E as estudiantes-service
-    participant U as cursos-service
+    autonumber
+    actor Cliente
+    participant Auth as auth-service (8081)
+    participant Mat as matriculas-service (8084)
+    participant Est as estudiantes-service (8082)
+    participant Cur as cursos-service (8083)
 
-    C->>M: 1. POST /api/matriculas
-    M->>A: 2. GET /auth/validate
-    A-->>M: claims y rol
-    M->>E: 3. GET /api/estudiantes/{id}
-    E->>A: 4. GET /auth/validate
-    A-->>E: claims y rol
-    E-->>M: EstudianteRemotoDTO
-    M->>U: 5. GET /api/cursos/{id}
-    U->>A: 6. GET /auth/validate
-    A-->>U: claims y rol
-    U-->>M: CursoRemotoDTO
-    M-->>C: 201 MatriculaDTO
+    Note over Cliente, Auth: 1. Emisión del JWT
+    Cliente->>Auth: POST /auth/login {"username":"admin","password":"admin123"}
+    Auth-->>Cliente: 200 {"token","username":"admin","role":"ADMIN"}
+
+    Note over Cliente, Cur: 2. Validación y propagación del Bearer
+    Cliente->>Mat: POST /api/matriculas Authorization Bearer
+    Mat->>Auth: GET /auth/validate Authorization Bearer
+    Auth-->>Mat: 200 {"valid":true,"username":"admin","role":"ADMIN","estudianteId":null}
+
+    Mat->>Est: GET /api/estudiantes/1 FeignAuthPropagationConfig copia el Bearer
+    Est->>Auth: GET /auth/validate Authorization Bearer
+    Auth-->>Est: 200 {"valid":true,"username":"admin","role":"ADMIN","estudianteId":null}
+    Est-->>Mat: 200 ApiResponse data EstudianteDTO
+
+    Mat->>Cur: GET /api/cursos/1 FeignAuthPropagationConfig copia el Bearer
+    Cur->>Auth: GET /auth/validate Authorization Bearer
+    Auth-->>Cur: 200 {"valid":true,"username":"admin","role":"ADMIN","estudianteId":null}
+    Cur-->>Mat: 200 ApiResponse data CursoDTO
+
+    Mat->>Mat: INSERT estado ACTIVA
+    Mat-->>Cliente: 201 ApiResponse data MatriculaDTO estado ACTIVA
 ```
 
 | # | Origen | Destino | Qué decide su fallo |
@@ -300,3 +312,35 @@ En matrículas, el filtro no guarda un `String`. Guarda `new UsuarioAutenticado(
 `GET /api/matriculas/mias` declara `@AuthenticationPrincipal UsuarioAutenticado usuario`. Spring inyecta ese principal por tipo. El método ignora cualquier query param. Si el principal es nulo o no trae `estudianteId`, lanza `AccessDeniedException` y el handler global responde **403** `AUTH_FORBIDDEN`. La regla de autorización de la ruta ya limitó el método al rol `ESTUDIANTE`; el principal aporta el dueño del dato.
 
 Quitar el tipo y dejar un `String` obligaría a volver a parsear el token o a hacer otra llamada para saber qué estudiante es el llamador. Poner el id en la URL lo dejaría bajo control del cliente. El record inmutable evita que el código de negocio altere el principal durante la petición, y `Principal.getName()` mantiene el username para trazas y para módulos que solo necesitan el nombre.
+
+## 5. Evidencias de verificación
+
+Las filas consolidan los resultados ya citados en la sección 2. El éxito de negocio viaja en `ApiResponse` (`success`, `message`, `data`). El **401** y el **403** de seguridad viajan en `ApiErrorResponse` (`success`, `message`, `errorCode`, `status`, `path`, `timestamp`), escrito por `CustomAuthenticationEntryPoint` y `CustomAccessDeniedHandler`. Un **400** de regla de negocio sigue siendo `ApiResponse`, no `ApiErrorResponse`.
+
+| Caso | Petición | Resultado citado en la sección 2 |
+|---|---|---|
+| Escritura de cursos sin rol | `POST /api/cursos` con token `DOCENTE` | **403** `AUTH_FORBIDDEN` |
+| Catálogo frente a directorio | `GET /api/cursos` y `GET /api/estudiantes` con token `ESTUDIANTE` | **200** en cursos, **403** en estudiantes |
+| Alta de estudiante | `POST /api/estudiantes` con token `DOCENTE` | **403** |
+| Listado paginado | `GET /api/estudiantes?page=0&size=2` | **200**, `totalElements` 50 |
+| Alta cruzada | `POST /api/matriculas` con `estudianteId` y `cursoId` existentes | **201**, estado `ACTIVA` |
+| Destino caído | Alta del estudiante 6 en el curso 2 con cursos-service detenido | **502**, código remoto `-1` |
+| Cupo | Tercera matrícula en `RED-001` (cupo 2, dos activas) | **400**, mensaje con `2/2` |
+| Reducción de cupo | `PUT` del cupo de `RED-001` a 1 con dos activas | **400** en cursos |
+| Anulación | `PUT /api/matriculas/3/anular` y una segunda llamada | La fila sigue legible en `ANULADA`; la segunda responde **400** |
+| Borrado con activas | `DELETE` del estudiante 1 y del curso `RED-001` | **409** |
+| Dueño del recurso | `GET /api/matriculas/mias?estudianteId=99` con token `estudiante` | **200**, matrícula del estudiante 1 |
+| Rol sobre `/mias` | `GET /api/matriculas/mias` con token `ADMIN` | **403** `AUTH_FORBIDDEN` |
+| Promedio | Notas 4.0, 3.0 y 5.0 en la matrícula 1; luego `PUT` del corte 1 a 4.5 | **4.10** y `completa=true`; después **4.25** |
+| Autor de la nota | Corrección del id 1 con token `admin` tras un alta de `docente` | `registradoPor` pasa de `docente` a `admin` |
+| Matrícula anulada | `POST /api/calificaciones` sobre la matrícula 3 | **400** |
+| Resumen ausente | `GET /api/calificaciones/matricula/99` | **404** |
+| Alta sobre id ausente | `POST /api/calificaciones` con matrícula 99999 | **400** |
+| Rol en calificaciones | `POST` y `GET /api/calificaciones/matricula/1` con token `estudiante`; `GET /mias` con ese token; `GET /mias` con `DOCENTE` | **403**, **403**, **200** solo de la matrícula 1, **403** |
+| Pruebas | `mvn test` en los cinco módulos, imagen `maven:3.9.9-eclipse-temurin-21` | 27 casos, 0 fallos, 0 errores |
+
+## 6. Propuesta de mejora
+
+El cupo se decide con una lectura y una escritura que no comparten bloqueo. `MatriculaServiceImpl.registrar` obtiene `cupoMaximo` por Feign, cuenta las filas `ACTIVA` con `countByCursoIdAndEstado` y, si el conteo es menor, hace `save`. No existe una restricción que limite la cantidad de matrículas activas de un curso. Dos transacciones pueden leer el mismo conteo, ver un lugar libre y confirmar las dos. La verificación secuencial de `RED-001` (tercera matrícula rechazada con `2/2`) no cubre ese interleaving.
+
+La corrección propuesta, sin cambiar el dueño del dato, es serializar el alta por `cursoId` dentro de matrículas: un bloqueo pesimista sobre una fila de control del curso, o un `INSERT` condicionado al conteo actual en la misma sentencia. El `GET` a cursos sigue siendo la fuente del tope. La ventana entre ese GET y el commit permanece para un cambio concurrente del cupo en el otro servicio; cerrarla exigiría repetir la lectura del cupo bajo el mismo bloqueo o rechazar el alta si el conteo confirmado ya no cabe. No hace falta una base compartida ni mover `cupoMaximo` a matrículas, que dejaría una copia desactualizada cuando cursos reduzca la oferta.
